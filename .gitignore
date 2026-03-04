@@ -1,0 +1,12 @@
+# Credentials
+credentials.json
+token.pickle
+.env
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Notebook (has API key)
+llm-retrieval-practice.ipynb
