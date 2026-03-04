@@ -5,20 +5,18 @@ Run with: python rag_service.py
 
 Endpoints:
     POST /ask          — Ask a question, get an AI-grounded answer
-    POST /upload       — Upload documents to index
-    POST /reindex      — Rebuild index from uploaded documents
+    POST /reindex      — Re-pull documents from Google Drive and rebuild index
     GET  /health       — Health check
     GET  /stats        — Index statistics
-    DELETE /clear      — Clear all uploaded documents
 """
 
 import os
 import io
-import shutil
+import pickle
 import numpy as np
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
@@ -29,13 +27,21 @@ from sklearn.metrics.pairwise import cosine_similarity
 import anthropic
 import pdfplumber
 
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+
 
 # =============================================================================
-# CONFIGURATION
+# CONFIGURATION — Update these for your environment
 # =============================================================================
 
-UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "YOUR_KEY_HERE")
+GDRIVE_CREDENTIALS_PATH = os.environ.get("GDRIVE_CREDENTIALS_PATH", "YOUR_JSON_CREDENTIALS_PATH_HERE")
+GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID", "YOUR_FOLDER_ID_HERE")
+GDRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+#FOLDER_PATH = os.environ.get("FOLDER_PATH", r".\documents")
 
 CHUNK_SIZE = 300
 CHUNK_OVERLAP = 50
@@ -47,14 +53,13 @@ LLM_TEMPERATURE = 0.1
 
 
 # =============================================================================
-# PYDANTIC MODELS
+# PYDANTIC MODELS — Request/Response schemas
 # =============================================================================
 
 class QueryRequest(BaseModel):
     question: str
-    api_key: str
     top_k: int = TOP_K
-    strict_mode: bool = True
+    strict_mode: bool = True   # True = no interpretation, False = allow it
 
 class Source(BaseModel):
     document: str
@@ -70,7 +75,7 @@ class QueryResponse(BaseModel):
 class IndexStats(BaseModel):
     total_documents: int
     total_chunks: int
-    vector_dimensions: Optional[int]
+    vector_dimensions: int
     document_names: List[str]
 
 class ReindexResponse(BaseModel):
@@ -78,22 +83,13 @@ class ReindexResponse(BaseModel):
     documents_loaded: int
     chunks_created: int
 
-class UploadResponse(BaseModel):
-    status: str
-    filename: str
-    characters: int
-
-class ClearResponse(BaseModel):
-    status: str
-    files_removed: int
-
 
 # =============================================================================
 # RAG PIPELINE
 # =============================================================================
 
 class RAGPipeline:
-    """Encapsulates the entire RAG pipeline."""
+    """Encapsulates the entire RAG pipeline as a single class."""
 
     def __init__(self):
         self.vectorizer = TfidfVectorizer(
@@ -104,49 +100,118 @@ class RAGPipeline:
         self.chunks = []
         self.chunk_vectors = None
         self.documents = []
+        self.llm_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        self.gdrive_service = None
         self.is_indexed = False
 
+    # --- Google Drive Connection ---
+    def connect_gdrive(self):
+        """Authenticate with Google Drive."""
+        creds = None
+        token_path = os.path.join(
+            os.path.dirname(GDRIVE_CREDENTIALS_PATH), "token.pickle"
+        )
+
+        if os.path.exists(token_path):
+            with open(token_path, "rb") as f:
+                creds = pickle.load(f)
+
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    GDRIVE_CREDENTIALS_PATH, GDRIVE_SCOPES
+                )
+                creds = flow.run_local_server(port=0)
+
+            with open(token_path, "wb") as f:
+                pickle.dump(creds, f)
+
+        self.gdrive_service = build("drive", "v3", credentials=creds)
+        print("✅ Connected to Google Drive")
+
     # --- Document Loading ---
-    def load_documents_from_uploads(self) -> List[dict]:
-        """Load all documents from the uploads folder."""
+    def load_documents_from_gdrive(self, folder_id: str) -> List[dict]:
+        """Load documents from a Google Drive folder."""
+        if not self.gdrive_service:
+            self.connect_gdrive()
+
+        results = self.gdrive_service.files().list(
+            q=f"'{folder_id}' in parents and trashed = false",
+            fields="files(id, name, mimeType)",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+            corpora="allDrives",
+        ).execute()
+
+        files = results.get("files", [])
         documents = []
 
-        if not os.path.exists(UPLOAD_DIR):
-            return documents
+        for file in files:
+            name = file["name"]
+            mime = file["mimeType"]
+            file_id = file["id"]
 
-        for filename in sorted(os.listdir(UPLOAD_DIR)):
-            filepath = os.path.join(UPLOAD_DIR, filename)
+            try:
+                if mime == "application/vnd.google-apps.document":
+                    content = self.gdrive_service.files().export(
+                        fileId=file_id, mimeType="text/plain"
+                    ).execute()
+                    text = content.decode("utf-8")
 
+                elif mime == "application/pdf":
+                    content = self.gdrive_service.files().get_media(
+                        fileId=file_id, supportsAllDrives=True
+                    ).execute()
+                    pdf = pdfplumber.open(io.BytesIO(content))
+                    text = "\n".join(
+                        p.extract_text() for p in pdf.pages if p.extract_text()
+                    )
+                    pdf.close()
+
+                elif mime == "text/plain":
+                    content = self.gdrive_service.files().get_media(
+                        fileId=file_id, supportsAllDrives=True
+                    ).execute()
+                    text = content.decode("utf-8")
+
+                else:
+                    print(f"  Skipping {name} ({mime})")
+                    continue
+
+                if len(text.strip()) > 10:
+                    documents.append({"id": name, "text": text, "source": name})
+                    print(f"  ✅ Loaded: {name} ({len(text)} chars)")
+
+            except Exception as e:
+                print(f"  ❌ Error loading {name}: {e}")
+
+        return documents
+
+    def load_documents_from_folder(self, folder_path: str) -> List[dict]:
+        """Load documents from a local folder (fallback)."""
+        documents = []
+        for filename in sorted(os.listdir(folder_path)):
+            filepath = os.path.join(folder_path, filename)
             try:
                 if filename.endswith(".txt"):
                     with open(filepath, "r", encoding="utf-8") as f:
                         text = f.read()
-
                 elif filename.endswith(".pdf"):
                     with pdfplumber.open(filepath) as pdf:
                         text = "\n".join(
                             p.extract_text() for p in pdf.pages if p.extract_text()
                         )
-
-                elif filename.endswith(".docx"):
-                    try:
-                        import docx
-                        doc = docx.Document(filepath)
-                        text = "\n".join(p.text for p in doc.paragraphs)
-                    except ImportError:
-                        print(f"  Skipping {filename} (install python-docx)")
-                        continue
-
                 else:
-                    print(f"  Skipping {filename} (unsupported type)")
                     continue
 
                 if len(text.strip()) > 10:
                     documents.append({"id": filename, "text": text, "source": filename})
-                    print(f"  Loaded: {filename} ({len(text)} chars)")
+                    print(f"  ✅ Loaded: {filename} ({len(text)} chars)")
 
             except Exception as e:
-                print(f"  Error loading {filename}: {e}")
+                print(f"  ❌ Error loading {filename}: {e}")
 
         return documents
 
@@ -179,13 +244,14 @@ class RAGPipeline:
         return chunks
 
     # --- Indexing ---
-    def index(self):
-        """Load uploaded documents, chunk, embed, and store vectors."""
-        self.documents = self.load_documents_from_uploads()
-
-        if not self.documents:
-            self.is_indexed = False
-            raise ValueError("No documents found. Upload files first.")
+    def index(self, folder_id: str = None, local_path: str = None):
+        """Load documents, chunk, embed, and store vectors."""
+        if folder_id:
+            self.documents = self.load_documents_from_gdrive(folder_id)
+        elif local_path:
+            self.documents = self.load_documents_from_folder(local_path)
+        else:
+            raise ValueError("Provide folder_id or local_path")
 
         self.chunks = []
         for doc in self.documents:
@@ -198,7 +264,7 @@ class RAGPipeline:
         self.chunk_vectors = self.vectorizer.fit_transform(chunk_texts)
         self.is_indexed = True
 
-        print(f"Indexed {len(self.chunks)} chunks from {len(self.documents)} documents")
+        print(f"✅ Indexed {len(self.chunks)} chunks from {len(self.documents)} documents")
 
     # --- Retrieval ---
     def retrieve(self, query: str, top_k: int = TOP_K) -> List[dict]:
@@ -213,6 +279,7 @@ class RAGPipeline:
         ]
 
     # --- Prompt Building ---
+# --- Prompt Building ---
     def build_prompt(self, query: str, results: List[dict], strict_mode: bool = True) -> str:
         """Build LLM prompt with retrieved context and guardrails."""
         context_parts = []
@@ -226,16 +293,14 @@ class RAGPipeline:
         if strict_mode:
             rules = """RULES:
 - Answer ONLY using the provided context below.
-- If the context does not contain the answer, say "I don't have that information in the current documents."
+- If the context does not contain the answer, say "I don't have that information."
 - Do NOT interpret, extrapolate, or infer beyond what is explicitly stated.
-- Cite which source document your answer comes from.
-- Be concise and precise."""
+- Cite which source document your answer comes from."""
         else:
             rules = """RULES:
 - Answer using the provided context below.
 - If the context does not contain the exact answer, provide your best interpretation and clearly state it is an interpretation.
-- Cite which source document your answer comes from.
-- Be concise and precise."""
+- Cite which source document your answer comes from."""
 
         return f"""You are an expert knowledge assistant.
 
@@ -249,10 +314,9 @@ QUESTION: {query}
 ANSWER:"""
 
     # --- LLM Call ---
-    def call_llm(self, prompt: str, api_key: str) -> str:
-        """Call Claude with the augmented prompt using the user's API key."""
-        client = anthropic.Anthropic(api_key=api_key)
-        response = client.messages.create(
+    def call_llm(self, prompt: str) -> str:
+        """Call Claude with the augmented prompt."""
+        response = self.llm_client.messages.create(
             model=LLM_MODEL,
             max_tokens=LLM_MAX_TOKENS,
             temperature=LLM_TEMPERATURE,
@@ -261,10 +325,10 @@ ANSWER:"""
         return response.content[0].text
 
     # --- Full Pipeline ---
-    def answer(self, query: str, api_key: str, top_k: int = TOP_K, strict_mode: bool = True) -> dict:
+    def answer(self, query: str, top_k: int = TOP_K, strict_mode: bool = True) -> dict:
         """Run the complete RAG pipeline."""
         if not self.is_indexed:
-            raise RuntimeError("Index not built. Upload documents and click Reindex.")
+            raise RuntimeError("Index not built — call /reindex first")
 
         results = self.retrieve(query, top_k)
         top_score = results[0]["score"]
@@ -279,19 +343,14 @@ ANSWER:"""
             }
 
         prompt = self.build_prompt(query, results, strict_mode)
-        answer = self.call_llm(prompt, api_key)
+        answer = self.call_llm(prompt)
 
-        # Check if LLM declined to answer — override confidence
-        if "don't have that information" in answer.lower():
-            confidence = "LOW"
-        else:
-            confidence = "HIGH" if top_score > 0.3 else "MEDIUM"
-
+        confidence = "HIGH" if top_score > 0.3 else "MEDIUM"
         sources = [
             {
                 "document": r["chunk"]["source"],
                 "score": round(r["score"], 3),
-                "text_preview": r["chunk"]["text"][:100],
+                "text_preview": r["chunk"]["text"][:500],
             }
             for r in results
         ]
@@ -310,77 +369,41 @@ ANSWER:"""
 
 app = FastAPI(
     title="RAG Service",
-    description="Upload documents, ask questions, get grounded answers powered by Claude.",
-    version="2.0.0",
+    description="Retrieval-Augmented Generation API powered by Claude",
+    version="1.0.0",
 )
 
+# Allow frontend to call this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # In production: specify exact frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Initialize pipeline
 pipeline = RAGPipeline()
-
-
-@app.post("/upload", response_model=UploadResponse)
-async def upload(file: UploadFile = File(...)):
-    """Upload a document (PDF, TXT, DOCX)."""
-    allowed = (".pdf", ".txt", ".docx")
-    ext = os.path.splitext(file.filename)[1].lower()
-
-    if ext not in allowed:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file type: {ext}. Allowed: {', '.join(allowed)}"
-        )
-
-    filepath = os.path.join(UPLOAD_DIR, file.filename)
-    content = await file.read()
-
-    with open(filepath, "wb") as f:
-        f.write(content)
-
-    print(f"Uploaded: {file.filename} ({len(content)} bytes)")
-
-    return UploadResponse(
-        status="uploaded",
-        filename=file.filename,
-        characters=len(content),
-    )
 
 
 @app.post("/ask", response_model=QueryResponse)
 def ask(query: QueryRequest):
     """Ask a question — retrieves relevant context and generates an answer."""
     if not pipeline.is_indexed:
-        raise HTTPException(
-            status_code=503,
-            detail="Index not built. Upload documents and click Reindex."
-        )
-
-    if not query.api_key or query.api_key == "YOUR_KEY_HERE":
-        raise HTTPException(
-            status_code=400,
-            detail="Please enter your Anthropic API key."
-        )
+        raise HTTPException(status_code=503, detail="Index not built. Call POST /reindex first.")
 
     try:
-        result = pipeline.answer(query.question, query.api_key, query.top_k, query.strict_mode)
+        result = pipeline.answer(query.question, query.top_k, query.strict_mode)
         return QueryResponse(**result)
-    except anthropic.AuthenticationError:
-        raise HTTPException(status_code=401, detail="Invalid API key.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/reindex", response_model=ReindexResponse)
 def reindex():
-    """Rebuild the index from uploaded documents."""
+    """Re-pull documents from Google Drive and rebuild the index."""
     try:
-        pipeline.index()
+        pipeline.index(folder_id=GDRIVE_FOLDER_ID)
         return ReindexResponse(
             status="success",
             documents_loaded=len(pipeline.documents),
@@ -390,39 +413,20 @@ def reindex():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.delete("/clear", response_model=ClearResponse)
-def clear():
-    """Delete all uploaded documents and clear the index."""
-    count = 0
-    if os.path.exists(UPLOAD_DIR):
-        count = len(os.listdir(UPLOAD_DIR))
-        shutil.rmtree(UPLOAD_DIR)
-        os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-    pipeline.chunks = []
-    pipeline.chunk_vectors = None
-    pipeline.documents = []
-    pipeline.is_indexed = False
-
-    return ClearResponse(status="cleared", files_removed=count)
-
-
 @app.get("/health")
 def health():
     """Health check."""
-    return {"status": "healthy", "indexed": pipeline.is_indexed}
+    return {
+        "status": "healthy",
+        "indexed": pipeline.is_indexed,
+    }
 
 
 @app.get("/stats", response_model=IndexStats)
 def stats():
     """Get current index statistics."""
     if not pipeline.is_indexed:
-        return IndexStats(
-            total_documents=0,
-            total_chunks=0,
-            vector_dimensions=None,
-            document_names=[],
-        )
+        raise HTTPException(status_code=503, detail="Index not built.")
 
     return IndexStats(
         total_documents=len(pipeline.documents),
@@ -437,14 +441,12 @@ def stats():
 # =============================================================================
 
 if __name__ == "__main__":
-    print("RAG Service v2.0 — Upload documents and ask questions")
-    print(f"Upload directory: {UPLOAD_DIR}")
-
-    # Auto-index if uploads folder already has files
-    if os.path.exists(UPLOAD_DIR) and os.listdir(UPLOAD_DIR):
-        try:
-            pipeline.index()
-        except Exception as e:
-            print(f"Could not auto-index: {e}")
+    # Try to build index on startup
+    print("🚀 Starting RAG Service...")
+    try:
+        pipeline.index(folder_id=GDRIVE_FOLDER_ID)
+    except Exception as e:
+        print(f"⚠️  Could not auto-index: {e}")
+        print("   Call POST /reindex after starting to build the index.")
 
     uvicorn.run(app, host="0.0.0.0", port=8000)

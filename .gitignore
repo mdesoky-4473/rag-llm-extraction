@@ -10,3 +10,6 @@ __pycache__/
 
 # Notebook (has API key)
 llm-retrieval-practice.ipynb
+
+# User uploads
+uploads/
