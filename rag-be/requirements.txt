@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+scikit-learn
+anthropic
+pdfplumber
+python-multipart
+numpy<2.0
